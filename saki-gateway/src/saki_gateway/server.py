@@ -26,6 +26,7 @@ from .memory import MemoryStore
 from .runtime_store import RuntimeStore
 from .trilium import TriliumClient
 from .scheduler import GatewayScheduler
+from .study_companion import DEFAULT_STUDY_RESPONSE_STYLE, StudyCompanionResponder
 from .tools import (
     build_default_registry,
     prepare_image_context,
@@ -95,6 +96,7 @@ class GatewayApp:
             self._runtime_db_path,
             self._event_log_path,
         )
+        self.study_responder = StudyCompanionResponder()
         self.trilium_client = TriliumClient(self.config_store.config.trilium)
         self.tools = build_default_registry(
             root,
@@ -1445,8 +1447,15 @@ class GatewayApp:
             "subject": record.subject,
             "mode": record.mode,
             "status": record.status,
+            "runtime_state": record.runtime_state,
             "planned_minutes": record.planned_minutes,
             "pomodoro_count": record.pomodoro_count,
+            "elapsed_minutes": record.elapsed_minutes,
+            "remaining_minutes": record.remaining_minutes,
+            "break_count": record.break_count,
+            "short_break_minutes": record.short_break_minutes,
+            "long_break_minutes": record.long_break_minutes,
+            "pause_started_at": record.pause_started_at,
             "started_at": record.started_at,
             "ended_at": record.ended_at,
             "actual_minutes": record.actual_minutes,
@@ -1456,6 +1465,106 @@ class GatewayApp:
             "created_at": record.created_at,
             "updated_at": record.updated_at,
         }
+
+    def _serialize_learning_session_event(self, record: Any) -> Dict[str, Any]:
+        return {
+            "id": record.event_id,
+            "session_id": record.session_id,
+            "event_type": record.event_type,
+            "runtime_state": record.runtime_state,
+            "payload": record.payload,
+            "created_at": record.created_at,
+        }
+
+    def _serialize_learning_session_response(self, record: Any) -> Dict[str, Any]:
+        return {
+            "id": record.response_id,
+            "session_id": record.session_id,
+            "event_id": record.event_id,
+            "event_type": record.event_type,
+            "message": record.message,
+            "style_config": record.style_config,
+            "delivery_status": record.delivery_status,
+            "created_at": record.created_at,
+        }
+
+    def _effective_learning_response_style(self, session_id: str = "") -> Dict[str, Any]:
+        if not hasattr(self, "study_responder"):
+            self.study_responder = StudyCompanionResponder()
+        scoped = self.runtime_store.get_learning_response_style(scope="session", scope_id=session_id) if session_id else None
+        default_style = self.runtime_store.get_learning_response_style(scope="default", scope_id="")
+        payload: Dict[str, Any] = {}
+        if default_style is not None:
+            payload.update(
+                {
+                    "dominance_style": default_style.dominance_style,
+                    "care_style": default_style.care_style,
+                    "praise_style": default_style.praise_style,
+                    "correction_style": default_style.correction_style,
+                }
+            )
+        if scoped is not None:
+            payload.update(
+                {
+                    "dominance_style": scoped.dominance_style,
+                    "care_style": scoped.care_style,
+                    "praise_style": scoped.praise_style,
+                    "correction_style": scoped.correction_style,
+                }
+            )
+        return self.study_responder.normalize_style(payload).__dict__
+
+    def _learning_response_framework(self, session: Any) -> Dict[str, Any]:
+        style = self.study_responder.normalize_style(
+            self._effective_learning_response_style(session.session_id)
+        )
+        framework = self.study_responder.inspect_framework(
+            mode=str(session.mode or "focus"),
+            style=style,
+        )
+        framework["session_id"] = session.session_id
+        return framework
+
+    def _queue_learning_session_response(self, event_record: Any) -> Optional[Dict[str, Any]]:
+        session = self.runtime_store.get_learning_session(event_record.session_id)
+        wellbeing_items = self.list_wellbeing_checkins_payload(session.session_id, limit=3)["items"]
+        wellbeing = wellbeing_items[0] if wellbeing_items else {}
+        style = self._effective_learning_response_style(session.session_id)
+        message = self.study_responder.build_message(
+            event_type=event_record.event_type,
+            session=self._serialize_learning_session(session),
+            style=self.study_responder.normalize_style(style),
+            wellbeing=wellbeing,
+            recent_events=[self._serialize_learning_session_event(item) for item in self.runtime_store.list_learning_session_events(session_id=session.session_id, limit=5)],
+        )
+        response = self.runtime_store.add_learning_session_response(
+            session_id=session.session_id,
+            event_id=event_record.event_id,
+            event_type=event_record.event_type,
+            message=message,
+            style_config=style,
+            delivery_status="queued",
+        )
+        return self._serialize_learning_session_response(response)
+
+    def _emit_learning_session_event(self, session_id: str, event_type: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        session = self.runtime_store.get_learning_session(session_id)
+        event_record = self.runtime_store.add_learning_session_event(
+            session_id=session_id,
+            event_type=event_type,
+            runtime_state=session.runtime_state,
+            payload=payload or {},
+        )
+        serialized = self._serialize_learning_session_event(event_record)
+        self._record_event(
+            f"learning_session::{event_type}",
+            serialized,
+            session_id=session_id,
+        )
+        response = self._queue_learning_session_response(event_record)
+        if response is not None:
+            serialized["response"] = response
+        return serialized
 
     def _serialize_wellbeing_checkin(self, record: Any) -> Dict[str, Any]:
         return {
@@ -1523,6 +1632,39 @@ class GatewayApp:
         ]
         return {"session_id": session_id, "items": items}
 
+    def list_learning_session_events_payload(self, session_id: str, limit: int = 20) -> Dict[str, Any]:
+        items = [
+            self._serialize_learning_session_event(record)
+            for record in self.runtime_store.list_learning_session_events(session_id=session_id, limit=max(1, min(limit, 100)))
+        ]
+        return {"session_id": session_id, "items": items}
+
+    def list_learning_session_responses_payload(self, session_id: str, limit: int = 20) -> Dict[str, Any]:
+        items = [
+            self._serialize_learning_session_response(record)
+            for record in self.runtime_store.list_learning_session_responses(session_id=session_id, limit=max(1, min(limit, 100)))
+        ]
+        return {"session_id": session_id, "items": items}
+
+    def get_learning_response_style_payload(self, session_id: str = "") -> Dict[str, Any]:
+        payload = {"session_id": session_id, "style": self._effective_learning_response_style(session_id)}
+        if session_id:
+            payload["framework"] = self._learning_response_framework(
+                self.runtime_store.get_learning_session(session_id)
+            )
+        return payload
+
+    def get_learning_response_framework_payload(self, session_id: str) -> Dict[str, Any]:
+        session = self.runtime_store.get_learning_session(session_id)
+        return self._learning_response_framework(session)
+
+    def update_learning_response_style_payload(self, body: Dict[str, Any], session_id: str = "") -> Dict[str, Any]:
+        style = self.study_responder.normalize_style(body).__dict__
+        scope = "session" if session_id else "default"
+        scope_id = session_id if session_id else ""
+        self.runtime_store.upsert_learning_response_style(scope=scope, scope_id=scope_id, **style)
+        return {"session_id": session_id, "style": style}
+
     def create_learning_session_payload(self, body: Dict[str, Any]) -> Dict[str, Any]:
         title = str(body.get("title", "") or "").strip()
         goal = str(body.get("goal", "") or "").strip()
@@ -1531,6 +1673,8 @@ class GatewayApp:
         mode = self._validate_learning_mode(str(body.get("mode", "focus") or "focus"))
         planned_minutes = int(body.get("planned_minutes", 25) or 25)
         pomodoro_count = int(body.get("pomodoro_count", 0) or 0)
+        short_break_minutes = max(1, int(body.get("short_break_minutes", 5) or 5))
+        long_break_minutes = max(short_break_minutes, int(body.get("long_break_minutes", 15) or 15))
         started_at = str(body.get("started_at", "") or "").strip() or datetime.utcnow().isoformat()
         record = self.runtime_store.create_learning_session(
             session_id=f"learn_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}",
@@ -1540,20 +1684,14 @@ class GatewayApp:
             mode=mode,
             planned_minutes=max(1, planned_minutes),
             pomodoro_count=max(0, pomodoro_count),
+            short_break_minutes=short_break_minutes,
+            long_break_minutes=long_break_minutes,
             started_at=started_at,
         )
         checkin_payload = body.get("start_checkin")
         if isinstance(checkin_payload, dict):
             self.add_wellbeing_checkin_payload(record.session_id, {"stage": "start", **checkin_payload})
-        self._record_event(
-            "learning_session_started",
-            {
-                "session_id": record.session_id,
-                "mode": record.mode,
-                "planned_minutes": record.planned_minutes,
-                "goal": record.goal,
-            },
-        )
+        self._emit_learning_session_event(record.session_id, "session_started", {"mode": record.mode, "planned_minutes": record.planned_minutes, "goal": record.goal})
         return {"item": self._serialize_learning_session(record)}
 
     def update_learning_session_payload(self, session_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -1570,7 +1708,54 @@ class GatewayApp:
             fields["planned_minutes"] = max(1, int(body.get("planned_minutes", 1) or 1))
         if "pomodoro_count" in body:
             fields["pomodoro_count"] = max(0, int(body.get("pomodoro_count", 0) or 0))
+        for key in ["elapsed_minutes", "remaining_minutes", "break_count", "short_break_minutes", "long_break_minutes"]:
+            if key in body:
+                fields[key] = max(0, int(body.get(key, 0) or 0))
         updated = self.runtime_store.update_learning_session(session_id, fields)
+        return {"item": self._serialize_learning_session(updated)}
+
+    def update_learning_session_runtime_payload(self, session_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        session = self.runtime_store.get_learning_session(session_id)
+        if session.status != "active":
+            raise ValueError("learning_session_not_active")
+        action = str(body.get("action", "") or "").strip().lower()
+        now = str(body.get("timestamp", "") or "").strip() or datetime.utcnow().isoformat()
+        elapsed = max(0, int(body.get("elapsed_minutes", session.elapsed_minutes) or 0))
+        remaining = max(0, int(body.get("remaining_minutes", session.remaining_minutes) or 0))
+        if action == "pause":
+            if session.runtime_state == "paused":
+                raise ValueError("learning_session_already_paused")
+            updated = self.runtime_store.set_learning_session_runtime_state(session_id, runtime_state="paused", pause_started_at=now, elapsed_minutes=elapsed, remaining_minutes=remaining)
+            self._emit_learning_session_event(session_id, "session_paused", {"elapsed_minutes": elapsed, "remaining_minutes": remaining})
+        elif action == "resume":
+            if session.runtime_state != "paused":
+                raise ValueError("learning_session_not_paused")
+            updated = self.runtime_store.set_learning_session_runtime_state(session_id, runtime_state="focus", pause_started_at="", elapsed_minutes=elapsed, remaining_minutes=remaining)
+            self._emit_learning_session_event(session_id, "session_resumed", {"elapsed_minutes": elapsed, "remaining_minutes": remaining})
+        elif action == "focus_completed":
+            updated = self.runtime_store.set_learning_session_runtime_state(
+                session_id,
+                runtime_state="focus_completed",
+                pause_started_at="",
+                elapsed_minutes=elapsed,
+                remaining_minutes=remaining,
+                pomodoro_count=max(session.pomodoro_count, int(body.get("pomodoro_count", session.pomodoro_count) or 0)),
+            )
+            self._emit_learning_session_event(session_id, "focus_completed", {"elapsed_minutes": elapsed, "remaining_minutes": remaining})
+        elif action == "break_started":
+            updated = self.runtime_store.set_learning_session_runtime_state(session_id, runtime_state="break", pause_started_at="", elapsed_minutes=elapsed, remaining_minutes=remaining, break_count=session.break_count + 1)
+            self._emit_learning_session_event(session_id, "break_started", {"break_count": updated.break_count})
+        elif action == "break_completed":
+            updated = self.runtime_store.set_learning_session_runtime_state(session_id, runtime_state="focus", pause_started_at="", elapsed_minutes=elapsed, remaining_minutes=remaining)
+            event_type = "recovery_completion" if session.mode == "recovery" else "break_completed"
+            self._emit_learning_session_event(session_id, event_type, {"break_count": updated.break_count})
+        elif action == "paused_too_long":
+            if session.runtime_state != "paused":
+                raise ValueError("learning_session_not_paused")
+            updated = session
+            self._emit_learning_session_event(session_id, "session_paused_too_long", {"pause_started_at": session.pause_started_at})
+        else:
+            raise ValueError("invalid_learning_runtime_action")
         return {"item": self._serialize_learning_session(updated)}
 
     def complete_learning_session_payload(self, session_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -1611,14 +1796,7 @@ class GatewayApp:
             session_id=updated.session_id,
         )
         self._refresh_active_memory()
-        self._record_event(
-            "learning_session_completed",
-            {
-                "session_id": updated.session_id,
-                "actual_minutes": updated.actual_minutes,
-                "mode": updated.mode,
-            },
-        )
+        self._emit_learning_session_event(updated.session_id, "session_completed", {"actual_minutes": updated.actual_minutes, "mode": updated.mode})
         return {"item": self._serialize_learning_session(updated)}
 
     def abandon_learning_session_payload(self, session_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -1642,14 +1820,7 @@ class GatewayApp:
         checkin_payload = body.get("end_checkin")
         if isinstance(checkin_payload, dict):
             self.add_wellbeing_checkin_payload(session_id, {"stage": "end", **checkin_payload})
-        self._record_event(
-            "learning_session_abandoned",
-            {
-                "session_id": updated.session_id,
-                "actual_minutes": updated.actual_minutes,
-                "mode": updated.mode,
-            },
-        )
+        self._emit_learning_session_event(updated.session_id, "session_abandoned", {"actual_minutes": updated.actual_minutes, "mode": updated.mode})
         return {"item": self._serialize_learning_session(updated)}
 
     def add_wellbeing_checkin_payload(self, session_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -1679,6 +1850,13 @@ class GatewayApp:
                 "stress_level": record.stress_level,
             },
         )
+        if stage == "start":
+            if record.energy_level is not None and record.energy_level <= 2:
+                self._emit_learning_session_event(session_id, "low_energy_start", {"energy_level": record.energy_level, "note": record.note})
+        if stage == "end":
+            session = self.runtime_store.get_learning_session(session_id)
+            if session.mode == "recovery" and (record.energy_level or 3) >= 3 and (record.stress_level is None or record.stress_level <= 3):
+                self._emit_learning_session_event(session_id, "recovery_completion", {"energy_level": record.energy_level, "stress_level": record.stress_level})
         return {"item": self._serialize_wellbeing_checkin(record)}
 
     def list_mcp_servers_payload(self) -> Dict[str, Any]:
@@ -3653,6 +3831,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                 limit = int(query.get("limit", ["20"])[0] or "20")
                 self._json(HTTPStatus.OK, app.list_learning_sessions_payload(status=status, limit=limit))
                 return
+            if parsed.path == "/api/learning-sessions/style":
+                session_id = parse_qs(parsed.query).get("session_id", [""])[0]
+                self._json(HTTPStatus.OK, app.get_learning_response_style_payload(session_id=session_id))
+                return
+            if parsed.path == "/api/learning-sessions/framework":
+                session_id = parse_qs(parsed.query).get("session_id", [""])[0]
+                self._json(HTTPStatus.OK, app.get_learning_response_framework_payload(session_id))
+                return
             if parsed.path.startswith("/api/learning-sessions/"):
                 tail = parsed.path.removeprefix("/api/learning-sessions/").strip("/")
                 if tail and "/" not in tail:
@@ -3662,6 +3848,16 @@ class RequestHandler(BaseHTTPRequestHandler):
                     session_id = tail[: -len("/checkins")]
                     limit = int(parse_qs(parsed.query).get("limit", ["20"])[0] or "20")
                     self._json(HTTPStatus.OK, app.list_wellbeing_checkins_payload(session_id, limit=limit))
+                    return
+                if tail.endswith("/events"):
+                    session_id = tail[: -len("/events")]
+                    limit = int(parse_qs(parsed.query).get("limit", ["20"])[0] or "20")
+                    self._json(HTTPStatus.OK, app.list_learning_session_events_payload(session_id, limit=limit))
+                    return
+                if tail.endswith("/responses"):
+                    session_id = tail[: -len("/responses")]
+                    limit = int(parse_qs(parsed.query).get("limit", ["20"])[0] or "20")
+                    self._json(HTTPStatus.OK, app.list_learning_session_responses_payload(session_id, limit=limit))
                     return
             if parsed.path == "/api/context":
                 self._json(HTTPStatus.OK, app.get_context_payload())
@@ -3742,11 +3938,18 @@ class RequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/learning-sessions/start":
                 self._json(HTTPStatus.CREATED, app.create_learning_session_payload(body))
                 return
+            if parsed.path == "/api/learning-sessions/style":
+                session_id = parse_qs(parsed.query).get("session_id", [""])[0]
+                self._json(HTTPStatus.OK, app.update_learning_response_style_payload(body, session_id=session_id))
+                return
             if parsed.path.startswith("/api/learning-sessions/"):
                 tail = parsed.path.removeprefix("/api/learning-sessions/").strip("/")
                 session_id, _, operation = tail.partition("/")
                 if operation == "update":
                     self._json(HTTPStatus.OK, app.update_learning_session_payload(session_id, body))
+                    return
+                if operation == "runtime":
+                    self._json(HTTPStatus.OK, app.update_learning_session_runtime_payload(session_id, body))
                     return
                 if operation == "complete":
                     self._json(HTTPStatus.OK, app.complete_learning_session_payload(session_id, body))

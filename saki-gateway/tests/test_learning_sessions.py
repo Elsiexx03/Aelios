@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from saki_gateway.runtime_store import RuntimeStore
 from saki_gateway.server import GatewayApp
+from saki_gateway.study_companion import StudyCompanionResponder
 
 
 class LearningSessionTests(unittest.TestCase):
@@ -23,6 +24,7 @@ class LearningSessionTests(unittest.TestCase):
         app._refresh_active_memory = lambda: None
         app._events = []
         app._record_event = lambda event_type, payload, **kwargs: app._events.append((event_type, payload))
+        app.study_responder = StudyCompanionResponder()
         return app
 
     def _start(self, app: GatewayApp, **overrides):
@@ -43,6 +45,9 @@ class LearningSessionTests(unittest.TestCase):
         item = self._start(app)
         self.assertEqual(item["status"], "active")
         self.assertEqual(item["planned_minutes"], 15)
+        self.assertEqual(item["runtime_state"], "focus")
+        events = app.list_learning_session_events_payload(item["id"])["items"]
+        self.assertEqual(events[0]["event_type"], "session_started")
 
     def test_prevent_multiple_active_sessions(self) -> None:
         app = self._make_app()
@@ -58,6 +63,35 @@ class LearningSessionTests(unittest.TestCase):
         )["item"]
         self.assertEqual(updated["planned_minutes"], 5)
         self.assertEqual(updated["mode"], "recovery")
+
+    def test_pause_and_resume_runtime_events(self) -> None:
+        app = self._make_app()
+        item = self._start(app)
+        paused = app.update_learning_session_runtime_payload(
+            item["id"],
+            {"action": "pause", "timestamp": "2026-01-02T10:05:00", "elapsed_minutes": 5, "remaining_minutes": 10},
+        )["item"]
+        self.assertEqual(paused["runtime_state"], "paused")
+        resumed = app.update_learning_session_runtime_payload(
+            item["id"],
+            {"action": "resume", "timestamp": "2026-01-02T10:08:00", "elapsed_minutes": 5, "remaining_minutes": 10},
+        )["item"]
+        self.assertEqual(resumed["runtime_state"], "focus")
+        event_types = [event["event_type"] for event in app.list_learning_session_events_payload(item["id"])["items"]]
+        self.assertIn("session_paused", event_types)
+        self.assertIn("session_resumed", event_types)
+
+    def test_focus_and_break_events(self) -> None:
+        app = self._make_app()
+        item = self._start(app)
+        app.update_learning_session_runtime_payload(item["id"], {"action": "focus_completed", "elapsed_minutes": 15, "remaining_minutes": 0})
+        on_break = app.update_learning_session_runtime_payload(item["id"], {"action": "break_started", "elapsed_minutes": 15, "remaining_minutes": 5})["item"]
+        self.assertEqual(on_break["runtime_state"], "break")
+        back = app.update_learning_session_runtime_payload(item["id"], {"action": "break_completed", "elapsed_minutes": 15, "remaining_minutes": 5})["item"]
+        self.assertEqual(back["runtime_state"], "focus")
+        event_types = [event["event_type"] for event in app.list_learning_session_events_payload(item["id"])["items"]]
+        self.assertIn("focus_completed", event_types)
+        self.assertIn("break_completed", event_types)
 
     def test_complete_learning_session(self) -> None:
         app = self._make_app()
@@ -125,6 +159,56 @@ class LearningSessionTests(unittest.TestCase):
         stages = {item["stage"] for item in checkins}
         self.assertEqual(stages, {"start", "end"})
 
+    def test_low_energy_start_generates_event(self) -> None:
+        app = self._make_app()
+        created = app.create_learning_session_payload(
+            {
+                "title": "英语复习",
+                "goal": "复习20个单词",
+                "mode": "recovery",
+                "planned_minutes": 10,
+                "start_checkin": {"energy_level": 1, "stress_level": 4, "note": "有点累，快撑不住"},
+            }
+        )["item"]
+        event_types = [event["event_type"] for event in app.list_learning_session_events_payload(created["id"])["items"]]
+        self.assertIn("low_energy_start", event_types)
+
+    def test_style_config_affects_response_selection(self) -> None:
+        app = self._make_app()
+        item = self._start(app)
+        app.update_learning_response_style_payload({"dominance_style": "high", "correction_style": "firm"}, session_id=item["id"])
+        app.update_learning_session_runtime_payload(item["id"], {"action": "pause", "elapsed_minutes": 6, "remaining_minutes": 9})
+        app.update_learning_session_runtime_payload(item["id"], {"action": "paused_too_long"})
+        responses = app.list_learning_session_responses_payload(item["id"])["items"]
+        paused_too_long = next(resp for resp in responses if resp["event_type"] == "session_paused_too_long")
+        self.assertIn("做五分钟", paused_too_long["message"])
+
+    def test_firm_vs_caring_response_behavior(self) -> None:
+        app = self._make_app()
+        firm = self._start(app, title="高强度")
+        app.update_learning_response_style_payload({"dominance_style": "high", "correction_style": "firm"}, session_id=firm["id"])
+        app.update_learning_session_runtime_payload(firm["id"], {"action": "pause", "elapsed_minutes": 7, "remaining_minutes": 8})
+        app.update_learning_session_runtime_payload(firm["id"], {"action": "paused_too_long"})
+        firm_message = next(resp["message"] for resp in app.list_learning_session_responses_payload(firm["id"])["items"] if resp["event_type"] == "session_paused_too_long")
+
+        app.complete_learning_session_payload(firm["id"], {"ended_at": "2026-01-02T10:15:00"})
+        caring = self._start(app, title="低能量", start_checkin={"energy_level": 1, "stress_level": 5, "note": "好累"})
+        app.update_learning_session_runtime_payload(caring["id"], {"action": "pause", "elapsed_minutes": 2, "remaining_minutes": 13})
+        app.update_learning_session_runtime_payload(caring["id"], {"action": "paused_too_long"})
+        caring_message = next(resp["message"] for resp in app.list_learning_session_responses_payload(caring["id"])["items"] if resp["event_type"] == "session_paused_too_long")
+        self.assertNotEqual(firm_message, caring_message)
+        self.assertIn("稳定收尾", caring_message)
+
+    def test_safety_constraint_no_degrading_output(self) -> None:
+        app = self._make_app()
+        item = self._start(app)
+        app.update_learning_response_style_payload({"dominance_style": "high", "praise_style": "possessive_lite"}, session_id=item["id"])
+        app.complete_learning_session_payload(item["id"], {"ended_at": "2026-01-02T10:20:00"})
+        for response in app.list_learning_session_responses_payload(item["id"])["items"]:
+            lowered = response["message"].lower()
+            for banned in ["punish", "worthless", "idiot", "stupid", "humiliate"]:
+                self.assertNotIn(banned, lowered)
+
     def test_list_current_active_session(self) -> None:
         app = self._make_app()
         created = self._start(app)
@@ -149,6 +233,31 @@ class LearningSessionTests(unittest.TestCase):
         payload = app.list_wellbeing_checkins_payload(created["id"])
         self.assertEqual(payload["session_id"], created["id"])
         self.assertEqual(len(payload["items"]), 2)
+
+    def test_inspection_lists_events_responses_and_style(self) -> None:
+        app = self._make_app()
+        created = self._start(app)
+        app.update_learning_response_style_payload({"care_style": "soft"}, session_id=created["id"])
+        app.update_learning_session_runtime_payload(created["id"], {"action": "focus_completed", "elapsed_minutes": 15, "remaining_minutes": 0})
+        events = app.list_learning_session_events_payload(created["id"])["items"]
+        responses = app.list_learning_session_responses_payload(created["id"])["items"]
+        style_payload = app.get_learning_response_style_payload(created["id"])
+        style = style_payload["style"]
+        framework = app.get_learning_response_framework_payload(created["id"])
+        self.assertGreaterEqual(len(events), 2)
+        self.assertGreaterEqual(len(responses), 1)
+        self.assertEqual(style["care_style"], "soft")
+        self.assertEqual(framework["layers"]["base_persona_slot"], "companion_base_default")
+        self.assertFalse(framework["notes"]["custom_persona_content"])
+
+    def test_framework_is_persona_ready_without_custom_content(self) -> None:
+        app = self._make_app()
+        created = self._start(app, mode="review")
+        framework = app.get_learning_response_framework_payload(created["id"])
+        self.assertEqual(framework["layers"]["context_overlay_slot"], "study_mode::review")
+        self.assertEqual(framework["layers"]["safety_boundary_slot"], "study_safety_default")
+        self.assertEqual(framework["notes"]["persona_injection"], "default_only")
+        self.assertFalse(framework["notes"]["custom_persona_content"])
 
 
 if __name__ == "__main__":

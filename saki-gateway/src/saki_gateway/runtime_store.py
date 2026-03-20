@@ -51,8 +51,15 @@ class LearningSessionRecord:
     subject: str
     mode: str
     status: str
+    runtime_state: str
     planned_minutes: int
     pomodoro_count: int
+    elapsed_minutes: int
+    remaining_minutes: int
+    break_count: int
+    short_break_minutes: int
+    long_break_minutes: int
+    pause_started_at: str
     started_at: str
     ended_at: str
     actual_minutes: int
@@ -62,6 +69,42 @@ class LearningSessionRecord:
     created_at: str
     updated_at: str
 
+
+
+
+@dataclass
+class LearningSessionEventRecord:
+    event_id: int
+    session_id: str
+    event_type: str
+    runtime_state: str
+    payload: Dict[str, Any]
+    created_at: str
+
+
+@dataclass
+class LearningSessionResponseRecord:
+    response_id: int
+    session_id: str
+    event_id: int
+    event_type: str
+    message: str
+    style_config: Dict[str, Any]
+    delivery_status: str
+    created_at: str
+
+
+@dataclass
+class LearningResponseStyleRecord:
+    style_id: int
+    scope: str
+    scope_id: str
+    dominance_style: str
+    care_style: str
+    praise_style: str
+    correction_style: str
+    created_at: str
+    updated_at: str
 
 @dataclass
 class WellbeingCheckinRecord:
@@ -161,8 +204,15 @@ class RuntimeStore:
               subject TEXT NOT NULL DEFAULT '',
               mode TEXT NOT NULL DEFAULT 'focus',
               status TEXT NOT NULL DEFAULT 'active',
+              runtime_state TEXT NOT NULL DEFAULT 'focus',
               planned_minutes INTEGER NOT NULL DEFAULT 25,
               pomodoro_count INTEGER NOT NULL DEFAULT 0,
+              elapsed_minutes INTEGER NOT NULL DEFAULT 0,
+              remaining_minutes INTEGER NOT NULL DEFAULT 0,
+              break_count INTEGER NOT NULL DEFAULT 0,
+              short_break_minutes INTEGER NOT NULL DEFAULT 5,
+              long_break_minutes INTEGER NOT NULL DEFAULT 15,
+              pause_started_at TEXT NOT NULL DEFAULT '',
               started_at TEXT NOT NULL DEFAULT '',
               ended_at TEXT NOT NULL DEFAULT '',
               actual_minutes INTEGER NOT NULL DEFAULT 0,
@@ -192,6 +242,47 @@ class RuntimeStore:
             CREATE INDEX IF NOT EXISTS idx_wellbeing_checkins_session_created
             ON wellbeing_checkins(session_id, created_at DESC);
 
+            CREATE TABLE IF NOT EXISTS learning_session_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              session_id TEXT NOT NULL,
+              event_type TEXT NOT NULL,
+              runtime_state TEXT NOT NULL DEFAULT '',
+              payload TEXT NOT NULL DEFAULT '{}',
+              created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_learning_session_events_session_created
+            ON learning_session_events(session_id, id DESC);
+
+            CREATE TABLE IF NOT EXISTS learning_session_responses (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              session_id TEXT NOT NULL,
+              event_id INTEGER NOT NULL DEFAULT 0,
+              event_type TEXT NOT NULL,
+              message TEXT NOT NULL,
+              style_config TEXT NOT NULL DEFAULT '{}',
+              delivery_status TEXT NOT NULL DEFAULT 'queued',
+              created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_learning_session_responses_session_created
+            ON learning_session_responses(session_id, id DESC);
+
+            CREATE TABLE IF NOT EXISTS learning_response_styles (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              scope TEXT NOT NULL DEFAULT 'default',
+              scope_id TEXT NOT NULL DEFAULT '',
+              dominance_style TEXT NOT NULL DEFAULT 'medium',
+              care_style TEXT NOT NULL DEFAULT 'steady',
+              praise_style TEXT NOT NULL DEFAULT 'warm',
+              correction_style TEXT NOT NULL DEFAULT 'gentle',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_learning_response_styles_scope
+            ON learning_response_styles(scope, scope_id);
+
             CREATE TABLE IF NOT EXISTS gateway_events (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               event_type TEXT NOT NULL,
@@ -203,7 +294,22 @@ class RuntimeStore:
             );
                 """
             )
+            self._ensure_column("learning_sessions", "runtime_state", "TEXT NOT NULL DEFAULT 'focus'")
+            self._ensure_column("learning_sessions", "elapsed_minutes", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column("learning_sessions", "remaining_minutes", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column("learning_sessions", "break_count", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column("learning_sessions", "short_break_minutes", "INTEGER NOT NULL DEFAULT 5")
+            self._ensure_column("learning_sessions", "long_break_minutes", "INTEGER NOT NULL DEFAULT 15")
+            self._ensure_column("learning_sessions", "pause_started_at", "TEXT NOT NULL DEFAULT ''")
             self.conn.commit()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        columns = {
+            str(row["name"])
+            for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def resolve_session(
         self,
@@ -614,6 +720,8 @@ class RuntimeStore:
         mode: str,
         planned_minutes: int,
         pomodoro_count: int,
+        short_break_minutes: int,
+        long_break_minutes: int,
         started_at: str,
     ) -> LearningSessionRecord:
         now = utcnow_iso()
@@ -626,9 +734,10 @@ class RuntimeStore:
             self.conn.execute(
                 """
                 INSERT INTO learning_sessions(
-                  id, title, goal, subject, mode, status, planned_minutes, pomodoro_count,
+                  id, title, goal, subject, mode, status, runtime_state, planned_minutes, pomodoro_count,
+                  elapsed_minutes, remaining_minutes, break_count, short_break_minutes, long_break_minutes, pause_started_at,
                   started_at, ended_at, actual_minutes, summary, blockers, next_step, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, 'active', ?, ?, ?, '', 0, '', '', '', ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, 'active', 'focus', ?, ?, 0, ?, 0, ?, ?, '', ?, '', 0, '', '', '', ?, ?)
                 """,
                 (
                     session_id,
@@ -638,6 +747,9 @@ class RuntimeStore:
                     mode,
                     planned_minutes,
                     pomodoro_count,
+                    planned_minutes,
+                    short_break_minutes,
+                    long_break_minutes,
                     started_at,
                     now,
                     now,
@@ -670,7 +782,24 @@ class RuntimeStore:
         return [self._row_to_learning_session(row) for row in rows]
 
     def update_learning_session(self, session_id: str, fields: Dict[str, Any]) -> LearningSessionRecord:
-        allowed_fields = {"title", "goal", "subject", "mode", "planned_minutes", "pomodoro_count", "summary", "blockers", "next_step"}
+        allowed_fields = {
+            "title",
+            "goal",
+            "subject",
+            "mode",
+            "planned_minutes",
+            "pomodoro_count",
+            "summary",
+            "blockers",
+            "next_step",
+            "runtime_state",
+            "elapsed_minutes",
+            "remaining_minutes",
+            "break_count",
+            "short_break_minutes",
+            "long_break_minutes",
+            "pause_started_at",
+        }
         assignments = []
         values: List[Any] = []
         for key, value in fields.items():
@@ -680,6 +809,44 @@ class RuntimeStore:
             values.append(value)
         if not assignments:
             return self.get_learning_session(session_id)
+        now = utcnow_iso()
+        with self._lock:
+            values.extend([now, session_id])
+            self.conn.execute(
+                f"UPDATE learning_sessions SET {', '.join(assignments)}, updated_at = ? WHERE id = ?",
+                tuple(values),
+            )
+            self.conn.commit()
+        return self.get_learning_session(session_id)
+
+    def set_learning_session_runtime_state(
+        self,
+        session_id: str,
+        *,
+        runtime_state: str,
+        pause_started_at: Optional[str] = None,
+        elapsed_minutes: Optional[int] = None,
+        remaining_minutes: Optional[int] = None,
+        break_count: Optional[int] = None,
+        pomodoro_count: Optional[int] = None,
+    ) -> LearningSessionRecord:
+        assignments = ["runtime_state = ?"]
+        values: List[Any] = [runtime_state]
+        if pause_started_at is not None:
+            assignments.append("pause_started_at = ?")
+            values.append(pause_started_at)
+        if elapsed_minutes is not None:
+            assignments.append("elapsed_minutes = ?")
+            values.append(max(0, elapsed_minutes))
+        if remaining_minutes is not None:
+            assignments.append("remaining_minutes = ?")
+            values.append(max(0, remaining_minutes))
+        if break_count is not None:
+            assignments.append("break_count = ?")
+            values.append(max(0, break_count))
+        if pomodoro_count is not None:
+            assignments.append("pomodoro_count = ?")
+            values.append(max(0, pomodoro_count))
         now = utcnow_iso()
         with self._lock:
             values.extend([now, session_id])
@@ -716,7 +883,8 @@ class RuntimeStore:
             self.conn.execute(
                 """
                 UPDATE learning_sessions
-                SET status = ?, ended_at = ?, actual_minutes = ?,
+                SET status = ?, runtime_state = CASE WHEN ? = 'completed' THEN 'completed' ELSE 'abandoned' END,
+                    ended_at = ?, actual_minutes = ?, remaining_minutes = 0, pause_started_at = '',
                     summary = CASE WHEN ? != '' THEN ? ELSE summary END,
                     blockers = CASE WHEN ? != '' THEN ? ELSE blockers END,
                     next_step = CASE WHEN ? != '' THEN ? ELSE next_step END,
@@ -724,6 +892,7 @@ class RuntimeStore:
                 WHERE id = ?
                 """,
                 (
+                    target_status,
                     target_status,
                     final_ended_at,
                     final_actual_minutes,
@@ -739,6 +908,132 @@ class RuntimeStore:
             )
             self.conn.commit()
         return self.get_learning_session(session_id)
+
+    def add_learning_session_event(
+        self,
+        *,
+        session_id: str,
+        event_type: str,
+        runtime_state: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> LearningSessionEventRecord:
+        now = utcnow_iso()
+        payload_text = json.dumps(payload or {}, ensure_ascii=False)
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO learning_session_events(session_id, event_type, runtime_state, payload, created_at)
+                VALUES(?, ?, ?, ?, ?)
+                """,
+                (session_id, event_type, runtime_state, payload_text, now),
+            )
+            self.conn.commit()
+            event_id = int(cursor.lastrowid)
+        return self.get_learning_session_event(event_id)
+
+    def get_learning_session_event(self, event_id: int) -> LearningSessionEventRecord:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM learning_session_events WHERE id = ?",
+                (event_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError("learning session event not found")
+        return self._row_to_learning_session_event(row)
+
+    def list_learning_session_events(self, *, session_id: str, limit: int = 20) -> List[LearningSessionEventRecord]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM learning_session_events WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+        return [self._row_to_learning_session_event(row) for row in rows]
+
+    def add_learning_session_response(
+        self,
+        *,
+        session_id: str,
+        event_id: int,
+        event_type: str,
+        message: str,
+        style_config: Optional[Dict[str, Any]] = None,
+        delivery_status: str = "queued",
+    ) -> LearningSessionResponseRecord:
+        now = utcnow_iso()
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO learning_session_responses(session_id, event_id, event_type, message, style_config, delivery_status, created_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    event_id,
+                    event_type,
+                    message,
+                    json.dumps(style_config or {}, ensure_ascii=False),
+                    delivery_status,
+                    now,
+                ),
+            )
+            self.conn.commit()
+            response_id = int(cursor.lastrowid)
+        return self.get_learning_session_response(response_id)
+
+    def get_learning_session_response(self, response_id: int) -> LearningSessionResponseRecord:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM learning_session_responses WHERE id = ?",
+                (response_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError("learning session response not found")
+        return self._row_to_learning_session_response(row)
+
+    def list_learning_session_responses(self, *, session_id: str, limit: int = 20) -> List[LearningSessionResponseRecord]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM learning_session_responses WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+        return [self._row_to_learning_session_response(row) for row in rows]
+
+    def upsert_learning_response_style(
+        self,
+        *,
+        scope: str,
+        scope_id: str,
+        dominance_style: str,
+        care_style: str,
+        praise_style: str,
+        correction_style: str,
+    ) -> LearningResponseStyleRecord:
+        now = utcnow_iso()
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO learning_response_styles(
+                  scope, scope_id, dominance_style, care_style, praise_style, correction_style, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(scope, scope_id) DO UPDATE SET
+                  dominance_style=excluded.dominance_style,
+                  care_style=excluded.care_style,
+                  praise_style=excluded.praise_style,
+                  correction_style=excluded.correction_style,
+                  updated_at=excluded.updated_at
+                """,
+                (scope, scope_id, dominance_style, care_style, praise_style, correction_style, now, now),
+            )
+            self.conn.commit()
+        return self.get_learning_response_style(scope=scope, scope_id=scope_id)
+
+    def get_learning_response_style(self, *, scope: str = "default", scope_id: str = "") -> Optional[LearningResponseStyleRecord]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM learning_response_styles WHERE scope = ? AND scope_id = ?",
+                (scope, scope_id),
+            ).fetchone()
+        return self._row_to_learning_response_style(row) if row is not None else None
 
     def add_wellbeing_checkin(
         self,
@@ -967,14 +1262,64 @@ class RuntimeStore:
             subject=str(row["subject"] or ""),
             mode=str(row["mode"] or "focus"),
             status=str(row["status"] or "active"),
+            runtime_state=str(row["runtime_state"] or "focus"),
             planned_minutes=int(row["planned_minutes"] or 0),
             pomodoro_count=int(row["pomodoro_count"] or 0),
+            elapsed_minutes=int(row["elapsed_minutes"] or 0),
+            remaining_minutes=int(row["remaining_minutes"] or 0),
+            break_count=int(row["break_count"] or 0),
+            short_break_minutes=int(row["short_break_minutes"] or 5),
+            long_break_minutes=int(row["long_break_minutes"] or 15),
+            pause_started_at=str(row["pause_started_at"] or ""),
             started_at=str(row["started_at"] or ""),
             ended_at=str(row["ended_at"] or ""),
             actual_minutes=int(row["actual_minutes"] or 0),
             summary=str(row["summary"] or ""),
             blockers=str(row["blockers"] or ""),
             next_step=str(row["next_step"] or ""),
+            created_at=str(row["created_at"] or ""),
+            updated_at=str(row["updated_at"] or ""),
+        )
+
+    def _row_to_learning_session_event(self, row: sqlite3.Row) -> LearningSessionEventRecord:
+        try:
+            payload = json.loads(str(row["payload"] or "{}"))
+        except json.JSONDecodeError:
+            payload = {"raw": str(row["payload"] or "")}
+        return LearningSessionEventRecord(
+            event_id=int(row["id"]),
+            session_id=str(row["session_id"] or ""),
+            event_type=str(row["event_type"] or ""),
+            runtime_state=str(row["runtime_state"] or ""),
+            payload=payload,
+            created_at=str(row["created_at"] or ""),
+        )
+
+    def _row_to_learning_session_response(self, row: sqlite3.Row) -> LearningSessionResponseRecord:
+        try:
+            style_config = json.loads(str(row["style_config"] or "{}"))
+        except json.JSONDecodeError:
+            style_config = {}
+        return LearningSessionResponseRecord(
+            response_id=int(row["id"]),
+            session_id=str(row["session_id"] or ""),
+            event_id=int(row["event_id"] or 0),
+            event_type=str(row["event_type"] or ""),
+            message=str(row["message"] or ""),
+            style_config=style_config,
+            delivery_status=str(row["delivery_status"] or ""),
+            created_at=str(row["created_at"] or ""),
+        )
+
+    def _row_to_learning_response_style(self, row: sqlite3.Row) -> LearningResponseStyleRecord:
+        return LearningResponseStyleRecord(
+            style_id=int(row["id"]),
+            scope=str(row["scope"] or ""),
+            scope_id=str(row["scope_id"] or ""),
+            dominance_style=str(row["dominance_style"] or "medium"),
+            care_style=str(row["care_style"] or "steady"),
+            praise_style=str(row["praise_style"] or "warm"),
+            correction_style=str(row["correction_style"] or "gentle"),
             created_at=str(row["created_at"] or ""),
             updated_at=str(row["updated_at"] or ""),
         )

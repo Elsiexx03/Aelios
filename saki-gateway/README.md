@@ -180,10 +180,18 @@ This slice adds a backend-first learning-session flow focused on sustainable stu
 `runtime_store` now persists:
 
 - `learning_sessions`
-  - `id`, `title`, `goal`, `subject`, `mode`, `status`, `planned_minutes`, `pomodoro_count`,
+  - `id`, `title`, `goal`, `subject`, `mode`, `status`, `runtime_state`
+  - `planned_minutes`, `pomodoro_count`, `elapsed_minutes`, `remaining_minutes`, `break_count`
+  - `short_break_minutes`, `long_break_minutes`, `pause_started_at`
   - `started_at`, `ended_at`, `actual_minutes`, `summary`, `blockers`, `next_step`, `created_at`, `updated_at`
 - `wellbeing_checkins`
   - `id`, `session_id`, `stage`, `energy_level`, `focus_level`, `mood_level`, `body_state_level`, `stress_level`, `note`, `created_at`
+- `learning_session_events`
+  - inspectable lifecycle/runtime events emitted by the backend
+- `learning_session_responses`
+  - queued proactive companion messages linked to learning events
+- `learning_response_styles`
+  - lightweight runtime response-style overrides (`default` or per-session scope)
 
 Mode lifecycle:
 - `focus | recovery | review`
@@ -192,11 +200,18 @@ Status lifecycle:
 - `active -> completed`
 - `active -> abandoned`
 
+Runtime state lifecycle (minimal backend slice):
+- `focus -> paused -> focus`
+- `focus -> focus_completed -> break -> focus`
+- terminal transitions force `completed` or `abandoned`
+
 Guardrails:
 - At most one `active` learning session at a time.
 - State transitions require active status.
 - `actual_minutes` is computed from `started_at`/`ended_at` when not provided.
 - Very small `planned_minutes` values are allowed and `mode=recovery` is first-class.
+- Invalid runtime transitions (for example resume without pause) are rejected.
+- Study-mode responses stay short, non-sexual, and avoid degrading/punitive language.
 
 ### Minimal backend/admin endpoints
 Authenticated dashboard API routes:
@@ -208,16 +223,91 @@ Authenticated dashboard API routes:
 - `POST /api/learning-sessions/start`
   - supports optional `start_checkin`
 - `POST /api/learning-sessions/{session_id}/update`
+- `POST /api/learning-sessions/{session_id}/runtime`
+  - `action` supports `pause`, `resume`, `focus_completed`, `break_started`, `break_completed`, `paused_too_long`
 - `POST /api/learning-sessions/{session_id}/complete`
   - supports optional `end_checkin`
 - `POST /api/learning-sessions/{session_id}/abandon`
   - supports optional `end_checkin`
 - `POST /api/learning-sessions/{session_id}/checkins`
+- `GET /api/learning-sessions/{session_id}/events?limit=20`
+- `GET /api/learning-sessions/{session_id}/responses?limit=20`
+- `GET /api/learning-sessions/style?session_id=`
+- `GET /api/learning-sessions/framework?session_id=`
+- `POST /api/learning-sessions/style?session_id=`
 
 ### Check-in behavior
 - `stage` supports `start | end`.
 - Structured levels are lightweight (1-5) and optional.
 - Short free-text `note` is supported.
+
+### Event model and response generation flow
+Supported event types in this slice:
+
+- `session_started`
+- `focus_completed`
+- `break_started`
+- `break_completed`
+- `session_paused`
+- `session_paused_too_long`
+- `session_resumed`
+- `session_completed`
+- `session_abandoned`
+- `low_energy_start`
+- `recovery_completion`
+
+Flow:
+1. learning-session lifecycle or runtime control emits a lightweight event row
+2. the event is mirrored into the existing gateway event log for debugging
+3. the backend builds a short companion response from:
+   - event type
+   - session mode
+   - recent wellbeing/check-in context if available
+   - effective response-style config
+   - layered persona-ready defaults
+4. the response is stored in `learning_session_responses` with `delivery_status=queued`
+
+This is intentionally backend-first so future chat insertion, banners, or notifications can reuse the same queue.
+
+### Layered persona-ready architecture
+This slice keeps the repository general by separating response shaping into simple layers instead of one giant prompt blob:
+
+- `base_persona_slot`
+  - current default: neutral companion support baseline
+- `context_overlay_slot`
+  - current default: mode-specific overlay such as `study_mode::focus`, `study_mode::recovery`, `study_mode::review`
+- `event_response_style_slot`
+  - derived from the active style config dimensions
+- `safety_boundary_slot`
+  - current default: study-safe boundary rules
+
+Current implementation details:
+
+- The framework uses safe default layer values only.
+- No private/project-specific persona prompt content is embedded in code.
+- Future persona injection can plug into the layer slots without rewriting the event system.
+- `GET /api/learning-sessions/framework?session_id=` exposes the active default framework for inspection/debugging.
+
+### Response-style config
+Safe default style:
+
+- `dominance_style=medium`
+- `care_style=steady`
+- `praise_style=warm`
+- `correction_style=gentle`
+
+Supported dimensions:
+
+- `dominance_style`: `low | medium | high`
+- `care_style`: `soft | steady | strict_care`
+- `praise_style`: `restrained | warm | possessive_lite`
+- `correction_style`: `gentle | firm`
+
+Notes:
+- Style is runtime/config behavior, not long-term identity memory.
+- Study mode does **not** automatically use sexual, intimate, or RP language.
+- When wellbeing suggests exhaustion, anxiety, or physical strain, responses shift toward stabilization and smaller next steps.
+- The current framework is persona-ready but not persona-customized yet.
 
 ### Minimal memory/digest-adjacent integration
 - On completion, a concise long-term memory item is upserted with category `learning_session`.
@@ -226,5 +316,9 @@ Authenticated dashboard API routes:
 
 Known limitations / TODO:
 - No polished timer/dashboard UI in this slice.
+- Responses are queued for inspection/future delivery, not yet inserted directly into the main chat timeline.
 - No advanced wellbeing analytics or scoring.
+- Mode overlays are lightweight defaults only; richer custom persona overlays are a future step.
 - TODO: optional Trilium completion note output can be added later if needed.
+- TODO: hook the queued responses into a future web notification/chat insertion surface.
+- TODO: add a clean custom persona injection path that fills the existing layer slots without coupling everything to one prompt blob.
