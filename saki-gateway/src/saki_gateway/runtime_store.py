@@ -60,6 +60,7 @@ class LearningSessionRecord:
     short_break_minutes: int
     long_break_minutes: int
     pause_started_at: str
+    resume_runtime_state: str
     started_at: str
     ended_at: str
     actual_minutes: int
@@ -90,6 +91,7 @@ class LearningSessionResponseRecord:
     event_type: str
     message: str
     style_config: Dict[str, Any]
+    response_context: Dict[str, Any]
     delivery_status: str
     created_at: str
 
@@ -213,6 +215,7 @@ class RuntimeStore:
               short_break_minutes INTEGER NOT NULL DEFAULT 5,
               long_break_minutes INTEGER NOT NULL DEFAULT 15,
               pause_started_at TEXT NOT NULL DEFAULT '',
+              resume_runtime_state TEXT NOT NULL DEFAULT 'focus',
               started_at TEXT NOT NULL DEFAULT '',
               ended_at TEXT NOT NULL DEFAULT '',
               actual_minutes INTEGER NOT NULL DEFAULT 0,
@@ -261,6 +264,7 @@ class RuntimeStore:
               event_type TEXT NOT NULL,
               message TEXT NOT NULL,
               style_config TEXT NOT NULL DEFAULT '{}',
+              response_context TEXT NOT NULL DEFAULT '{}',
               delivery_status TEXT NOT NULL DEFAULT 'queued',
               created_at TEXT NOT NULL
             );
@@ -301,6 +305,8 @@ class RuntimeStore:
             self._ensure_column("learning_sessions", "short_break_minutes", "INTEGER NOT NULL DEFAULT 5")
             self._ensure_column("learning_sessions", "long_break_minutes", "INTEGER NOT NULL DEFAULT 15")
             self._ensure_column("learning_sessions", "pause_started_at", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column("learning_sessions", "resume_runtime_state", "TEXT NOT NULL DEFAULT 'focus'")
+            self._ensure_column("learning_session_responses", "response_context", "TEXT NOT NULL DEFAULT '{}'")
             self.conn.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -735,9 +741,9 @@ class RuntimeStore:
                 """
                 INSERT INTO learning_sessions(
                   id, title, goal, subject, mode, status, runtime_state, planned_minutes, pomodoro_count,
-                  elapsed_minutes, remaining_minutes, break_count, short_break_minutes, long_break_minutes, pause_started_at,
+                  elapsed_minutes, remaining_minutes, break_count, short_break_minutes, long_break_minutes, pause_started_at, resume_runtime_state,
                   started_at, ended_at, actual_minutes, summary, blockers, next_step, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, 'active', 'focus', ?, ?, 0, ?, 0, ?, ?, '', ?, '', 0, '', '', '', ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, 'active', 'focus', ?, ?, 0, ?, 0, ?, ?, '', 'focus', ?, '', 0, '', '', '', ?, ?)
                 """,
                 (
                     session_id,
@@ -825,6 +831,7 @@ class RuntimeStore:
         *,
         runtime_state: str,
         pause_started_at: Optional[str] = None,
+        resume_runtime_state: Optional[str] = None,
         elapsed_minutes: Optional[int] = None,
         remaining_minutes: Optional[int] = None,
         break_count: Optional[int] = None,
@@ -835,6 +842,9 @@ class RuntimeStore:
         if pause_started_at is not None:
             assignments.append("pause_started_at = ?")
             values.append(pause_started_at)
+        if resume_runtime_state is not None:
+            assignments.append("resume_runtime_state = ?")
+            values.append(resume_runtime_state)
         if elapsed_minutes is not None:
             assignments.append("elapsed_minutes = ?")
             values.append(max(0, elapsed_minutes))
@@ -884,7 +894,7 @@ class RuntimeStore:
                 """
                 UPDATE learning_sessions
                 SET status = ?, runtime_state = CASE WHEN ? = 'completed' THEN 'completed' ELSE 'abandoned' END,
-                    ended_at = ?, actual_minutes = ?, remaining_minutes = 0, pause_started_at = '',
+                    ended_at = ?, actual_minutes = ?, remaining_minutes = 0, pause_started_at = '', resume_runtime_state = 'focus',
                     summary = CASE WHEN ? != '' THEN ? ELSE summary END,
                     blockers = CASE WHEN ? != '' THEN ? ELSE blockers END,
                     next_step = CASE WHEN ? != '' THEN ? ELSE next_step END,
@@ -957,14 +967,15 @@ class RuntimeStore:
         event_type: str,
         message: str,
         style_config: Optional[Dict[str, Any]] = None,
+        response_context: Optional[Dict[str, Any]] = None,
         delivery_status: str = "queued",
     ) -> LearningSessionResponseRecord:
         now = utcnow_iso()
         with self._lock:
             cursor = self.conn.execute(
                 """
-                INSERT INTO learning_session_responses(session_id, event_id, event_type, message, style_config, delivery_status, created_at)
-                VALUES(?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO learning_session_responses(session_id, event_id, event_type, message, style_config, response_context, delivery_status, created_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -972,6 +983,7 @@ class RuntimeStore:
                     event_type,
                     message,
                     json.dumps(style_config or {}, ensure_ascii=False),
+                    json.dumps(response_context or {}, ensure_ascii=False),
                     delivery_status,
                     now,
                 ),
@@ -1271,6 +1283,7 @@ class RuntimeStore:
             short_break_minutes=int(row["short_break_minutes"] or 5),
             long_break_minutes=int(row["long_break_minutes"] or 15),
             pause_started_at=str(row["pause_started_at"] or ""),
+            resume_runtime_state=str(row["resume_runtime_state"] or "focus"),
             started_at=str(row["started_at"] or ""),
             ended_at=str(row["ended_at"] or ""),
             actual_minutes=int(row["actual_minutes"] or 0),
@@ -1300,6 +1313,10 @@ class RuntimeStore:
             style_config = json.loads(str(row["style_config"] or "{}"))
         except json.JSONDecodeError:
             style_config = {}
+        try:
+            response_context = json.loads(str(row["response_context"] or "{}"))
+        except json.JSONDecodeError:
+            response_context = {}
         return LearningSessionResponseRecord(
             response_id=int(row["id"]),
             session_id=str(row["session_id"] or ""),
@@ -1307,6 +1324,7 @@ class RuntimeStore:
             event_type=str(row["event_type"] or ""),
             message=str(row["message"] or ""),
             style_config=style_config,
+            response_context=response_context,
             delivery_status=str(row["delivery_status"] or ""),
             created_at=str(row["created_at"] or ""),
         )

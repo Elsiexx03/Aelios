@@ -1456,6 +1456,7 @@ class GatewayApp:
             "short_break_minutes": record.short_break_minutes,
             "long_break_minutes": record.long_break_minutes,
             "pause_started_at": record.pause_started_at,
+            "resume_runtime_state": record.resume_runtime_state,
             "started_at": record.started_at,
             "ended_at": record.ended_at,
             "actual_minutes": record.actual_minutes,
@@ -1484,6 +1485,7 @@ class GatewayApp:
             "event_type": record.event_type,
             "message": record.message,
             "style_config": record.style_config,
+            "response_context": record.response_context,
             "delivery_status": record.delivery_status,
             "created_at": record.created_at,
         }
@@ -1519,7 +1521,7 @@ class GatewayApp:
         wellbeing_items = self.list_wellbeing_checkins_payload(session.session_id, limit=3)["items"]
         wellbeing = wellbeing_items[0] if wellbeing_items else {}
         style = self._effective_learning_response_style(session.session_id)
-        message = self.study_responder.build_message(
+        plan = self.study_responder.build_response_plan(
             event_type=event_record.event_type,
             session=self._serialize_learning_session(session),
             style=self.study_responder.normalize_style(style),
@@ -1530,8 +1532,9 @@ class GatewayApp:
             session_id=session.session_id,
             event_id=event_record.event_id,
             event_type=event_record.event_type,
-            message=message,
+            message=plan.message,
             style_config=style,
+            response_context=plan.debug,
             delivery_status="queued",
         )
         return self._serialize_learning_session_response(response)
@@ -1590,6 +1593,41 @@ class GatewayApp:
         delta = ended - started
         return max(0, int(delta.total_seconds() // 60))
 
+    def _validate_runtime_transition(self, current_state: str, action: str) -> None:
+        allowed = {
+            "pause": {"focus", "break", "focus_completed"},
+            "resume": {"paused"},
+            "focus_completed": {"focus"},
+            "break_started": {"focus_completed"},
+            "break_completed": {"break"},
+            "paused_too_long": {"paused"},
+        }
+        allowed_states = allowed.get(action)
+        if not allowed_states:
+            raise ValueError("invalid_learning_runtime_action")
+        if current_state not in allowed_states:
+            raise ValueError(f"invalid_runtime_transition:{current_state}->{action}")
+
+    def _coerce_runtime_minutes(self, body: Dict[str, Any], session: Any, *, break_minutes: int | None = None) -> tuple[int, int]:
+        elapsed = max(0, int(body.get("elapsed_minutes", session.elapsed_minutes) or 0))
+        default_remaining = break_minutes if break_minutes is not None else session.remaining_minutes
+        remaining = max(0, int(body.get("remaining_minutes", default_remaining) or 0))
+        return elapsed, remaining
+
+    def _next_pomodoro_count(self, session: Any, body: Dict[str, Any]) -> int:
+        if body.get("pomodoro_count") not in {None, ""}:
+            return max(session.pomodoro_count, int(body.get("pomodoro_count") or 0))
+        return max(0, session.pomodoro_count + 1)
+
+    def _break_runtime_details(self, session: Any, pomodoro_count: int) -> Dict[str, Any]:
+        long_break_due = pomodoro_count > 0 and pomodoro_count % 4 == 0
+        break_minutes = session.long_break_minutes if long_break_due else session.short_break_minutes
+        return {
+            "break_kind": "long" if long_break_due else "short",
+            "break_minutes": break_minutes,
+            "pomodoro_count": pomodoro_count,
+        }
+
     def list_learning_sessions_payload(self, status: str = "", limit: int = 20) -> Dict[str, Any]:
         normalized_status = str(status or "").strip().lower()
         if normalized_status and normalized_status not in {"active", "completed", "abandoned"}:
@@ -1637,6 +1675,20 @@ class GatewayApp:
 
     def get_learning_response_style_payload(self, session_id: str = "") -> Dict[str, Any]:
         return {"session_id": session_id, "style": self._effective_learning_response_style(session_id)}
+
+    def get_learning_response_framework_payload(self, session_id: str = "") -> Dict[str, Any]:
+        session = self.runtime_store.get_learning_session(session_id) if session_id else None
+        wellbeing_items = self.list_wellbeing_checkins_payload(session_id, limit=1)["items"] if session_id else []
+        wellbeing = wellbeing_items[0] if wellbeing_items else {}
+        style = self.study_responder.normalize_style(self._effective_learning_response_style(session_id))
+        return {
+            "session_id": session_id,
+            "framework": self.study_responder.describe_framework(
+                session=self._serialize_learning_session(session) if session else {},
+                style=style,
+                wellbeing=wellbeing,
+            ),
+        }
 
     def update_learning_response_style_payload(self, body: Dict[str, Any], session_id: str = "") -> Dict[str, Any]:
         style = self.study_responder.normalize_style(body).__dict__
@@ -1700,41 +1752,93 @@ class GatewayApp:
             raise ValueError("learning_session_not_active")
         action = str(body.get("action", "") or "").strip().lower()
         now = str(body.get("timestamp", "") or "").strip() or datetime.utcnow().isoformat()
-        elapsed = max(0, int(body.get("elapsed_minutes", session.elapsed_minutes) or 0))
-        remaining = max(0, int(body.get("remaining_minutes", session.remaining_minutes) or 0))
+        self._validate_runtime_transition(session.runtime_state, action)
         recent_checkin = self.list_wellbeing_checkins_payload(session_id, limit=1)["items"]
         if action == "pause":
-            if session.runtime_state == "paused":
-                raise ValueError("learning_session_already_paused")
-            updated = self.runtime_store.set_learning_session_runtime_state(session_id, runtime_state="paused", pause_started_at=now, elapsed_minutes=elapsed, remaining_minutes=remaining)
-            self._emit_learning_session_event(session_id, "session_paused", {"elapsed_minutes": elapsed, "remaining_minutes": remaining})
+            elapsed, remaining = self._coerce_runtime_minutes(body, session)
+            updated = self.runtime_store.set_learning_session_runtime_state(
+                session_id,
+                runtime_state="paused",
+                pause_started_at=now,
+                resume_runtime_state=session.runtime_state,
+                elapsed_minutes=elapsed,
+                remaining_minutes=remaining,
+            )
+            self._emit_learning_session_event(session_id, "session_paused", {
+                "elapsed_minutes": elapsed,
+                "remaining_minutes": remaining,
+                "resume_runtime_state": session.runtime_state,
+            })
         elif action == "resume":
-            if session.runtime_state != "paused":
-                raise ValueError("learning_session_not_paused")
-            updated = self.runtime_store.set_learning_session_runtime_state(session_id, runtime_state="focus", pause_started_at="", elapsed_minutes=elapsed, remaining_minutes=remaining)
-            self._emit_learning_session_event(session_id, "session_resumed", {"elapsed_minutes": elapsed, "remaining_minutes": remaining})
+            elapsed, remaining = self._coerce_runtime_minutes(body, session)
+            resume_state = session.resume_runtime_state or "focus"
+            updated = self.runtime_store.set_learning_session_runtime_state(
+                session_id,
+                runtime_state=resume_state,
+                pause_started_at="",
+                resume_runtime_state="focus",
+                elapsed_minutes=elapsed,
+                remaining_minutes=remaining,
+            )
+            self._emit_learning_session_event(session_id, "session_resumed", {
+                "elapsed_minutes": elapsed,
+                "remaining_minutes": remaining,
+                "resumed_to": resume_state,
+            })
         elif action == "focus_completed":
+            elapsed, remaining = self._coerce_runtime_minutes(body, session)
+            pomodoro_count = self._next_pomodoro_count(session, body)
             updated = self.runtime_store.set_learning_session_runtime_state(
                 session_id,
                 runtime_state="focus_completed",
                 pause_started_at="",
+                resume_runtime_state="focus",
                 elapsed_minutes=elapsed,
                 remaining_minutes=remaining,
-                pomodoro_count=max(session.pomodoro_count, int(body.get("pomodoro_count", session.pomodoro_count) or 0)),
+                pomodoro_count=pomodoro_count,
             )
-            self._emit_learning_session_event(session_id, "focus_completed", {"elapsed_minutes": elapsed, "remaining_minutes": remaining})
+            self._emit_learning_session_event(session_id, "focus_completed", {
+                "elapsed_minutes": elapsed,
+                "remaining_minutes": remaining,
+                "pomodoro_count": pomodoro_count,
+            })
         elif action == "break_started":
-            updated = self.runtime_store.set_learning_session_runtime_state(session_id, runtime_state="break", pause_started_at="", elapsed_minutes=elapsed, remaining_minutes=remaining, break_count=session.break_count + 1)
-            self._emit_learning_session_event(session_id, "break_started", {"break_count": updated.break_count})
+            details = self._break_runtime_details(session, session.pomodoro_count)
+            elapsed, remaining = self._coerce_runtime_minutes(body, session, break_minutes=details["break_minutes"])
+            updated = self.runtime_store.set_learning_session_runtime_state(
+                session_id,
+                runtime_state="break",
+                pause_started_at="",
+                resume_runtime_state="focus",
+                elapsed_minutes=elapsed,
+                remaining_minutes=remaining,
+                break_count=session.break_count + 1,
+            )
+            self._emit_learning_session_event(session_id, "break_started", {
+                "break_count": updated.break_count,
+                **details,
+            })
         elif action == "break_completed":
-            updated = self.runtime_store.set_learning_session_runtime_state(session_id, runtime_state="focus", pause_started_at="", elapsed_minutes=elapsed, remaining_minutes=remaining)
+            elapsed, remaining = self._coerce_runtime_minutes(body, session)
+            updated = self.runtime_store.set_learning_session_runtime_state(
+                session_id,
+                runtime_state="focus",
+                pause_started_at="",
+                resume_runtime_state="focus",
+                elapsed_minutes=elapsed,
+                remaining_minutes=remaining,
+            )
             event_type = "recovery_completion" if session.mode == "recovery" else "break_completed"
-            self._emit_learning_session_event(session_id, event_type, {"break_count": updated.break_count})
+            self._emit_learning_session_event(session_id, event_type, {
+                "break_count": updated.break_count,
+                "next_runtime_state": "focus",
+            })
         elif action == "paused_too_long":
-            if session.runtime_state != "paused":
-                raise ValueError("learning_session_not_paused")
             updated = session
-            self._emit_learning_session_event(session_id, "session_paused_too_long", {"pause_started_at": session.pause_started_at})
+            self._emit_learning_session_event(session_id, "session_paused_too_long", {
+                "pause_started_at": session.pause_started_at,
+                "resume_runtime_state": session.resume_runtime_state,
+            })
         else:
             raise ValueError("invalid_learning_runtime_action")
         if recent_checkin and action == "focus_completed" and recent_checkin[0].get("energy_level", 5) <= 2:
@@ -3817,6 +3921,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/learning-sessions/style":
                 session_id = parse_qs(parsed.query).get("session_id", [""])[0]
                 self._json(HTTPStatus.OK, app.get_learning_response_style_payload(session_id=session_id))
+                return
+            if parsed.path == "/api/learning-sessions/framework":
+                session_id = parse_qs(parsed.query).get("session_id", [""])[0]
+                self._json(HTTPStatus.OK, app.get_learning_response_framework_payload(session_id=session_id))
                 return
             if parsed.path.startswith("/api/learning-sessions/"):
                 tail = parsed.path.removeprefix("/api/learning-sessions/").strip("/")

@@ -72,26 +72,57 @@ class LearningSessionTests(unittest.TestCase):
             {"action": "pause", "timestamp": "2026-01-02T10:05:00", "elapsed_minutes": 5, "remaining_minutes": 10},
         )["item"]
         self.assertEqual(paused["runtime_state"], "paused")
+        self.assertEqual(paused["resume_runtime_state"], "focus")
         resumed = app.update_learning_session_runtime_payload(
             item["id"],
             {"action": "resume", "timestamp": "2026-01-02T10:08:00", "elapsed_minutes": 5, "remaining_minutes": 10},
         )["item"]
         self.assertEqual(resumed["runtime_state"], "focus")
-        event_types = [event["event_type"] for event in app.list_learning_session_events_payload(item["id"])["items"]]
+        events = app.list_learning_session_events_payload(item["id"])["items"]
+        event_types = [event["event_type"] for event in events]
         self.assertIn("session_paused", event_types)
         self.assertIn("session_resumed", event_types)
+        resumed_event = next(event for event in events if event["event_type"] == "session_resumed")
+        self.assertEqual(resumed_event["payload"]["resumed_to"], "focus")
+
+
+    def test_resume_restores_break_runtime_state(self) -> None:
+        app = self._make_app()
+        item = self._start(app)
+        app.update_learning_session_runtime_payload(item["id"], {"action": "focus_completed", "elapsed_minutes": 15, "remaining_minutes": 0})
+        on_break = app.update_learning_session_runtime_payload(item["id"], {"action": "break_started"})["item"]
+        self.assertEqual(on_break["runtime_state"], "break")
+        paused = app.update_learning_session_runtime_payload(item["id"], {"action": "pause", "timestamp": "2026-01-02T10:16:00"})["item"]
+        self.assertEqual(paused["resume_runtime_state"], "break")
+        resumed = app.update_learning_session_runtime_payload(item["id"], {"action": "resume", "timestamp": "2026-01-02T10:18:00"})["item"]
+        self.assertEqual(resumed["runtime_state"], "break")
 
     def test_focus_and_break_events(self) -> None:
         app = self._make_app()
         item = self._start(app)
-        app.update_learning_session_runtime_payload(item["id"], {"action": "focus_completed", "elapsed_minutes": 15, "remaining_minutes": 0})
-        on_break = app.update_learning_session_runtime_payload(item["id"], {"action": "break_started", "elapsed_minutes": 15, "remaining_minutes": 5})["item"]
+        completed = app.update_learning_session_runtime_payload(item["id"], {"action": "focus_completed", "elapsed_minutes": 15, "remaining_minutes": 0})["item"]
+        self.assertEqual(completed["pomodoro_count"], 2)
+        on_break = app.update_learning_session_runtime_payload(item["id"], {"action": "break_started", "elapsed_minutes": 15})["item"]
         self.assertEqual(on_break["runtime_state"], "break")
+        self.assertEqual(on_break["remaining_minutes"], 5)
         back = app.update_learning_session_runtime_payload(item["id"], {"action": "break_completed", "elapsed_minutes": 15, "remaining_minutes": 5})["item"]
         self.assertEqual(back["runtime_state"], "focus")
-        event_types = [event["event_type"] for event in app.list_learning_session_events_payload(item["id"])["items"]]
+        events = app.list_learning_session_events_payload(item["id"])["items"]
+        event_types = [event["event_type"] for event in events]
         self.assertIn("focus_completed", event_types)
         self.assertIn("break_completed", event_types)
+        break_event = next(event for event in events if event["event_type"] == "break_started")
+        self.assertEqual(break_event["payload"]["break_kind"], "short")
+        self.assertEqual(break_event["payload"]["break_minutes"], 5)
+
+
+    def test_invalid_runtime_transition_rejected(self) -> None:
+        app = self._make_app()
+        item = self._start(app)
+        with self.assertRaises(ValueError):
+            app.update_learning_session_runtime_payload(item["id"], {"action": "break_started"})
+        with self.assertRaises(ValueError):
+            app.update_learning_session_runtime_payload(item["id"], {"action": "break_completed"})
 
     def test_complete_learning_session(self) -> None:
         app = self._make_app()
@@ -234,7 +265,7 @@ class LearningSessionTests(unittest.TestCase):
         self.assertEqual(payload["session_id"], created["id"])
         self.assertEqual(len(payload["items"]), 2)
 
-    def test_inspection_lists_events_responses_and_style(self) -> None:
+    def test_inspection_lists_events_responses_style_and_framework(self) -> None:
         app = self._make_app()
         created = self._start(app)
         app.update_learning_response_style_payload({"care_style": "soft"}, session_id=created["id"])
@@ -242,9 +273,20 @@ class LearningSessionTests(unittest.TestCase):
         events = app.list_learning_session_events_payload(created["id"])["items"]
         responses = app.list_learning_session_responses_payload(created["id"])["items"]
         style = app.get_learning_response_style_payload(created["id"])["style"]
+        framework = app.get_learning_response_framework_payload(created["id"])["framework"]
         self.assertGreaterEqual(len(events), 2)
         self.assertGreaterEqual(len(responses), 1)
         self.assertEqual(style["care_style"], "soft")
+        self.assertIn("layered_persona", framework)
+        self.assertEqual(responses[0]["response_context"]["safety"]["explicit_language_allowed"], False)
+
+    def test_framework_is_persona_ready_without_custom_persona_content(self) -> None:
+        app = self._make_app()
+        created = self._start(app, mode="review")
+        framework = app.get_learning_response_framework_payload(created["id"])["framework"]
+        self.assertEqual(framework["layered_persona"]["base_persona_slot"], "neutral_companion")
+        self.assertEqual(framework["mode_overlay"], "study_review")
+        self.assertIn("Future persona injection", framework["todo"])
 
 
 if __name__ == "__main__":
